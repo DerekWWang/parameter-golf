@@ -84,7 +84,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.03))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -102,7 +102,7 @@ class Hyperparameters:
     swa_every = int(os.environ.get("SWA_EVERY", 50))  # tighter: collect more recent checkpoints
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
@@ -114,7 +114,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.1))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.0))
 
     # Value Embeddings: 1 shared table, per-layer scales (saves 50% VE params)
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
@@ -325,7 +325,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,lambda_param",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,lambda_param,log_scale",
     ).split(",")
     if pattern
 )
@@ -552,12 +552,21 @@ class CastedLinear(nn.Linear):
             bits = self.quant_bits
             qmax = 2 ** (bits - 1) - 1  # 31 for int6, 15 for int5
             qmin = -(qmax + 1)           # -32 for int6, -16 for int5
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax))
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), qmin, qmax) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
+            log_scale = getattr(self, 'log_scale', None)
+            if log_scale is not None:
+                # LSQ: learned per-row scale with STE
+                scale = log_scale.exp().to(w.dtype)
+                w_scaled = w / scale
+                w_q = (w_scaled.round().clamp(qmin, qmax) - w_scaled).detach() + w_scaled
+                w = w_q * scale
+            else:
+                # Fixed per-row scale with STE
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    row_max = w32.abs().amax(dim=1)
+                    scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax))
+                    w_q = (torch.clamp(torch.round(w32 / scale[:, None]), qmin, qmax) * scale[:, None]).to(x.dtype)
+                w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -1138,7 +1147,8 @@ def quantize_intN_per_row(t: Tensor, bits: int = 6) -> tuple[Tensor, Tensor]:
 def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     return quantize_intN_per_row(t, bits=6)
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str],
+                        learned_scales: dict[str, Tensor] | None = None):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -1163,7 +1173,19 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             # MLP weights use int5 (ReLU² zeroes negatives → half-used range),
             # attention weights use int6 (need precision for Q/K dot products)
             bits = 5 if cat == "mlp" else 6
-            q, s = quantize_intN_per_row(t, bits=bits)
+            qmax = 2 ** (bits - 1) - 1
+            qmin = -(qmax + 1)
+            # Use LSQ learned scales if available, otherwise compute from data
+            ls_key = name.rsplit('.', 1)[0] + '.log_scale' if '.' in name else None
+            if learned_scales and ls_key and ls_key in learned_scales:
+                s = learned_scales[ls_key].exp().to(torch.float16).squeeze(-1)
+                t32 = t.float()
+                if t32.ndim == 2:
+                    q = torch.clamp(torch.round(t32 / s.float()[:, None]), qmin, qmax).to(torch.int8)
+                else:
+                    q = torch.clamp(torch.round(t32 / s.float()), qmin, qmax).to(torch.int8)
+            else:
+                q, s = quantize_intN_per_row(t, bits=bits)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": f"int{bits}"}
@@ -1328,6 +1350,19 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # LSQ: register learnable per-row quantization scales on all quantized CastedLinear layers
+    if args.qat_enabled:
+        with torch.no_grad():
+            for module in base_model.modules():
+                if isinstance(module, CastedLinear) and module.weight.ndim == 2:
+                    qmax = 2 ** (module.quant_bits - 1) - 1
+                    mean_abs = module.weight.float().abs().mean(dim=-1, keepdim=True)
+                    init_s = 2 * mean_abs / (qmax ** 0.5)
+                    module.log_scale = nn.Parameter(
+                        torch.log(init_s.clamp(min=1e-8)).to(device=module.weight.device)
+                    )
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1358,6 +1393,12 @@ def main() -> None:
     # gnp_scale removed in v22
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    # LSQ: add learned quantization scales for non-block CastedLinear layers (block ones
+    # are already captured via block_named_params + CONTROL_TENSOR_NAME_PATTERNS filter)
+    block_param_ids = {id(p) for _, p in block_named_params}
+    for module in base_model.modules():
+        if isinstance(module, CastedLinear) and hasattr(module, 'log_scale') and id(module.log_scale) not in block_param_ids:
+            scalar_params.append(module.log_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
@@ -1410,6 +1451,8 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    lsq_count = sum(1 for m in base_model.modules() if isinstance(m, CastedLinear) and hasattr(m, 'log_scale'))
+    log0(f"qat:full_from_step0 lsq_layers:{lsq_count} mixed_bits:int5_mlp+int6_attn")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:diff_attn+gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} lambda_init:{args.diff_attn_lambda_init}")
@@ -1525,9 +1568,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
-            CastedLinear._qat_enabled = True
-            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1616,7 +1656,13 @@ def main() -> None:
     # -----------------------------
 
     full_state_dict = base_model.state_dict()
-    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+    # Extract learned LSQ scales before filtering them from export
+    lsq_scales = {k: v.detach().cpu() for k, v in full_state_dict.items() if k.endswith('.log_scale')}
+    if lsq_scales:
+        for k, v in lsq_scales.items():
+            s = v.exp().squeeze()
+            log0(f"lsq_scale:{k} mean:{s.mean():.6f} std:{s.std():.6f} min:{s.min():.6f} max:{s.max():.6f}")
+    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k and not k.endswith('.log_scale')}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
@@ -1629,7 +1675,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
 
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, learned_scales=lsq_scales or None)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
