@@ -724,11 +724,7 @@ class GPT(nn.Module):
                 skip_idx = self.num_loop_iters - 1 - iteration
                 alpha = torch.sigmoid(self.skip_weights[skip_idx]).to(x.dtype)
                 x = x + alpha * encoder_hiddens[skip_idx]
-            # Gradient-checkpointed block execution
-            block_out = grad_checkpoint(
-                block, x, x0, lora.A, lora.B,
-                use_reentrant=False,
-            )
+            block_out = block(x, x0, lora.A, lora.B)
             # Layer scale: dampened residual update for deep recurrence stability
             ls = self.layer_scale[iteration].to(x.dtype)
             x = x + ls * (block_out - x)
@@ -963,7 +959,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Separate block params (Muon for 2D matrices, AdamW for scalars/controls)

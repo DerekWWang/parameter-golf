@@ -73,3 +73,9 @@ All other techniques unchanged: Per-row int6 quantization + zstd-22, 3x MLP expa
 | Skip weights | 4 x 512 = 2K | 4 scalars |
 | Layer scales | - | 8 scalars |
 | Embeddings, bigram | ~1.5M | ~1.5M (unchanged) |
+
+RUN_ID=deeprec_sp1024 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+torchrun --standalone --nproc_per_node=4 records/track_10min_16mb/2026-03-23_DepthRecurrence_4x8_LoRA_UNet/train_gpt.py
