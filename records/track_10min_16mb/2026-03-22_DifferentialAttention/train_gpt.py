@@ -103,7 +103,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     # Differential Attention
@@ -544,15 +544,19 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
+    quant_bits: int = 6  # per-instance: 6 for attention, 5 for MLP
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            bits = self.quant_bits
+            qmax = 2 ** (bits - 1) - 1  # 31 for int6, 15 for int5
+            qmin = -(qmax + 1)           # -32 for int6, -16 for int5
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax))
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), qmin, qmax) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -905,6 +909,11 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # Mixed quantization: int5 for MLP weights (ReLU² makes them more compressible),
+        # int6 for attention weights (need precision for Q/K dot products)
+        for block in self.blocks:
+            block.mlp.fc.quant_bits = 5
+            block.mlp.proj.quant_bits = 5
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1112,17 +1121,22 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_intN_per_row(t: Tensor, bits: int = 6) -> tuple[Tensor, Tensor]:
+    qmax = 2 ** (bits - 1) - 1   # 31 for int6, 15 for int5
+    qmin = -(qmax + 1)            # -32 for int6, -16 for int5
     t32 = t.float()
     if t32.ndim == 2:
         row_max = t32.abs().amax(dim=1)
-        scale = (row_max / 31.0).clamp_min(1.0 / 31.0).to(torch.float16)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -32, 31).to(torch.int8)
+        scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax)).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), qmin, qmax).to(torch.int8)
         return q, scale
     amax = t32.abs().max().item()
-    scale = torch.tensor(amax / 31.0 if amax > 0 else 1.0, dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -32, 31).to(torch.int8)
+    scale = torch.tensor(amax / float(qmax) if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), qmin, qmax).to(torch.int8)
     return q, scale
+
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    return quantize_intN_per_row(t, bits=6)
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     num_layers_total = max(
@@ -1146,10 +1160,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         # tok_emb.weight falls through to int8 via "embed" category
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+            # MLP weights use int5 (ReLU² zeroes negatives → half-used range),
+            # attention weights use int6 (need precision for Q/K dot products)
+            bits = 5 if cat == "mlp" else 6
+            q, s = quantize_intN_per_row(t, bits=bits)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": f"int{bits}"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
