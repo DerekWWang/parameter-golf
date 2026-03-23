@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+from flash_attn import flash_attn_func
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -686,9 +686,14 @@ class CausalSelfAttention(nn.Module):
         gain = self.q_gain.to(dtype=q1.dtype)[None, None, :, None]
         q1 = q1 * gain
         q2 = q2 * gain
-        # Two flash_attn calls: FA3 supports headdim_qk (sub_dim) != headdim_v (head_dim)
-        y1 = flash_attn_3_func(q1, k1, v, causal=True)  # (B, T, H, head_dim)
-        y2 = flash_attn_3_func(q2, k2, v, causal=True)  # (B, T, H, head_dim)
+        # Pad Q/K sub-heads to match V head_dim for FA2 compatibility
+        pad_size = self.head_dim - sub_dim
+        q1_pad = F.pad(q1, (0, pad_size))
+        k1_pad = F.pad(k1, (0, pad_size))
+        q2_pad = F.pad(q2, (0, pad_size))
+        k2_pad = F.pad(k2, (0, pad_size))
+        y1 = flash_attn_func(q1_pad, k1_pad, v, causal=True)  # (B, T, H, head_dim)
+        y2 = flash_attn_func(q2_pad, k2_pad, v, causal=True)  # (B, T, H, head_dim)
         # Differential subtraction with clamped learnable lambda
         lambda_ = self.lambda_param.clamp(0.0, 1.5).to(dtype=y1.dtype)[None, None, :, None]
         y = y1 - lambda_ * y2
